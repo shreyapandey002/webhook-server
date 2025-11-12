@@ -1,37 +1,44 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import List
 import asyncpg
 import httpx
 import os
+import hmac
+import hashlib
 
 app = FastAPI(title="Composio FastAPI Server")
 
 # Environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # For verifying Composio webhook
 
-# ---------- Neon DB helper ----------
+db_pool: asyncpg.pool.Pool | None = None
+
+# ---------- Startup / Shutdown ----------
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+@app.on_event("shutdown")
+async def shutdown():
+    await db_pool.close()
+
+# ---------- Neon DB helpers ----------
 async def save_connected_account(email_id: str, connected_account_id: str):
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        query = """
-            INSERT INTO connected_accounts(email_id, connected_account_id, created_at)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users(email_id, connected_account_id, created_at)
             VALUES($1, $2, NOW())
             ON CONFLICT (email_id) DO UPDATE SET connected_account_id = EXCLUDED.connected_account_id
-        """
-        await conn.execute(query, email_id, connected_account_id)
-    finally:
-        await conn.close()
+        """, email_id, connected_account_id)
 
 async def get_connected_account_id(email_id: str):
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        query = "SELECT connected_account_id FROM connected_accounts WHERE email_id = $1"
-        row = await conn.fetchrow(query, email_id)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT connected_account_id FROM users WHERE email_id = $1", email_id)
         return row["connected_account_id"] if row else None
-    finally:
-        await conn.close()
 
 # ---------- Pydantic models ----------
 class ConnectedAccount(BaseModel):
@@ -52,15 +59,32 @@ async def save_account(payload: ConnectedAccount):
         await save_connected_account(payload.email_id, payload.connected_account_id)
         return {"status": "success"}
     except Exception as e:
+        print("Error saving connected account:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- Helper: verify webhook ----------
+def verify_webhook(request: Request, body: bytes):
+    signature = request.headers.get("x-webhook-signature")
+    if not signature:
+        return False
+    computed_hmac = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed_hmac, signature)
 
 # ---------- Composio webhook endpoint ----------
 @app.post("/composio-webhook")
-async def composio_webhook(payload: WebhookPayload):
+async def composio_webhook(request: Request):
+    body = await request.body()
+
+    # Verify webhook signature
+    if not verify_webhook(request, body):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    payload = WebhookPayload.parse_raw(body)
+
     try:
         row = payload.row_data
-        if len(row) < 1 or not row[-1]:
-            raise HTTPException(status_code=400, detail="Email missing in row_data")
+        if len(row) < 4:
+            raise HTTPException(status_code=400, detail="Incomplete row data")
         email_id = row[-1].strip()
 
         # Lookup connected_account_id
@@ -68,15 +92,11 @@ async def composio_webhook(payload: WebhookPayload):
         if not connected_account_id:
             raise HTTPException(status_code=404, detail="Connected account not found")
 
-        # Map row_data → Salesforce contact (snake_case)
+        # Map row_data → Salesforce contact (snake_case, without email)
         contact_data = {
-            "salutation": row[1] if len(row) > 1 else "",
-            "first_name": row[2] if len(row) > 2 else "",
-            "last_name": row[3] if len(row) > 3 else "",
-            "email": email_id if email_id else "",
-            "phone": "",          # optional
-            "mailing_street": "", # optional
-            "languages__c": ""    # optional
+            "salutation": row[1],
+            "first_name": row[2],
+            "last_name": row[3]
         }
 
         if not contact_data["last_name"]:
@@ -98,7 +118,6 @@ async def composio_webhook(payload: WebhookPayload):
             result = response.json()
             print(f"SALESFORCE_CREATE_CONTACT result: {result}")
 
-        # Return 200 OK to Composio
         return {"status": "success", "detail": "Trigger handled"}
 
     except Exception as e:
