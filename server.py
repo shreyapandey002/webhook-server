@@ -1,50 +1,27 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
-from typing import List
-import asyncpg
+from typing import List, Optional
 import httpx
 import os
 import hmac
 import hashlib
 
-app = FastAPI(title="Composio FastAPI Server")
+app = FastAPI(title="Composio Webhook Server - Secure Single User")
 
-# Environment variables
-DATABASE_URL = os.getenv("DATABASE_URL")
-COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # For verifying Composio webhook
+# ------------------------------
+# CONFIG
+# ------------------------------
+COMPOSIO_API_KEY = os.getenv("COMPOSIO_API_KEY", "ak_D5D8su1vCNMqIxyI71il")
 
-db_pool: asyncpg.pool.Pool | None = None
+# Hardcode your user's connected account (for shreya2002pandey@gmail.com)
+CONNECTED_ACCOUNT_ID = "ca_LdMKDhu7AUxJ"
 
-# ---------- Startup / Shutdown ----------
-@app.on_event("startup")
-async def startup():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+# The secret you get after registering your webhook in Composio
+COMPOSIO_WEBHOOK_SECRET = os.getenv("COMPOSIO_WEBHOOK_SECRET")
 
-@app.on_event("shutdown")
-async def shutdown():
-    await db_pool.close()
-
-# ---------- Neon DB helpers ----------
-async def save_connected_account(email_id: str, connected_account_id: str):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users(email_id, connected_account_id, created_at)
-            VALUES($1, $2, NOW())
-            ON CONFLICT (email_id) DO UPDATE SET connected_account_id = EXCLUDED.connected_account_id
-        """, email_id, connected_account_id)
-
-async def get_connected_account_id(email_id: str):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT connected_account_id FROM users WHERE email_id = $1", email_id)
-        return row["connected_account_id"] if row else None
-
-# ---------- Pydantic models ----------
-class ConnectedAccount(BaseModel):
-    email_id: str
-    connected_account_id: str
-
+# ------------------------------
+# MODELS
+# ------------------------------
 class WebhookPayload(BaseModel):
     detected_at: str
     row_data: List[str]
@@ -52,57 +29,55 @@ class WebhookPayload(BaseModel):
     sheet_name: str
     spreadsheet_id: str
 
-# ---------- Save connected account endpoint ----------
-@app.post("/save-connected-account")
-async def save_account(payload: ConnectedAccount):
-    try:
-        await save_connected_account(payload.email_id, payload.connected_account_id)
-        return {"status": "success"}
-    except Exception as e:
-        print("Error saving connected account:", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ---------- Helper: verify webhook ----------
-def verify_webhook(request: Request, body: bytes):
-    signature = request.headers.get("x-webhook-signature")
+# ------------------------------
+# HELPERS
+# ------------------------------
+def verify_signature(payload_body: bytes, signature: Optional[str]) -> bool:
+    """
+    Verify Composio webhook signature using HMAC SHA256.
+    """
     if not signature:
         return False
-    computed_hmac = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(computed_hmac, signature)
 
-# ---------- Composio webhook endpoint ----------
+    expected_sig = hmac.new(
+        key=COMPOSIO_WEBHOOK_SECRET.encode(),
+        msg=payload_body,
+        digestmod=hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(expected_sig, signature)
+
+# ------------------------------
+# WEBHOOK ENDPOINT
+# ------------------------------
 @app.post("/composio-webhook")
-async def composio_webhook(request: Request):
-    body = await request.body()
-
-    # Verify webhook signature
-    if not verify_webhook(request, body):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-    payload = WebhookPayload.parse_raw(body)
-
+async def composio_webhook(request: Request, composio_signature: Optional[str] = Header(None)):
     try:
+        # Read raw request body
+        body = await request.body()
+
+        # Verify webhook authenticity
+        if not verify_signature(body, composio_signature):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+        # Parse the JSON payload
+        payload = WebhookPayload.parse_raw(body)
         row = payload.row_data
+
         if len(row) < 4:
-            raise HTTPException(status_code=400, detail="Incomplete row data")
-        email_id = row[-1].strip()
+            raise HTTPException(status_code=400, detail="Insufficient data in row")
 
-        # Lookup connected_account_id
-        connected_account_id = await get_connected_account_id(email_id)
-        if not connected_account_id:
-            raise HTTPException(status_code=404, detail="Connected account not found")
-
-        # Map row_data → Salesforce contact (snake_case, without email)
+        # Map Google Sheets row → Salesforce contact (NO email)
         contact_data = {
-            "salutation": row[1],
-            "first_name": row[2],
-            "last_name": row[3]
+            "salutation": row[1] if len(row) > 1 else "",
+            "first_name": row[2] if len(row) > 2 else "",
+            "last_name": row[3] if len(row) > 3 else "",
         }
 
         if not contact_data["last_name"]:
-            raise HTTPException(status_code=400, detail="Last name is required for Salesforce contact")
+            raise HTTPException(status_code=400, detail="Last name is required")
 
-        # Call Composio tool
+        # Call Composio SALESFORCE_CREATE_CONTACT tool
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://backend.composio.dev/api/v3/tools/execute/SALESFORCE_CREATE_CONTACT",
@@ -111,15 +86,20 @@ async def composio_webhook(request: Request):
                     "Content-Type": "application/json"
                 },
                 json={
-                    "connected_account_id": connected_account_id,
+                    "connected_account_id": CONNECTED_ACCOUNT_ID,
                     "arguments": contact_data
-                }
+                },
+                timeout=60
             )
-            result = response.json()
-            print(f"SALESFORCE_CREATE_CONTACT result: {result}")
 
-        return {"status": "success", "detail": "Trigger handled"}
+            result = response.json()
+            print("SALESFORCE_CREATE_CONTACT result:", result)
+
+            if response.status_code != 200 or not result.get("successful", True):
+                raise HTTPException(status_code=400, detail=f"Salesforce error: {result}")
+
+        return {"status": "success", "message": "Salesforce contact created"}
 
     except Exception as e:
         print(f"Webhook error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
